@@ -163,7 +163,7 @@ app.post('/api/auth/verify', async (req, res) => {
     let isValid = false
     if (isAdmin) {
       // 管理后台验证
-      isValid = password === process.env.ADMIN_PASSWORD
+      isValid = password === (process.env.ADMIN_PASSWORD || '123456')
     } else {
       // 普通用户验证，不需要传入dsn参数
       isValid = await verifyPassword(password)

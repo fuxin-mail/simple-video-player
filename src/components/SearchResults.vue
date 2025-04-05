@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import type { ResourceSite } from '../types'
 import { load } from 'cheerio'
 import type { CheerioAPI } from 'cheerio'
@@ -24,6 +24,10 @@ const { isDark } = useTheme()
 
 // 添加排序状态
 const isReversed = ref(true) // 默认倒序
+
+// 添加 IPTV 源相关状态
+const isIPTVSource = ref<{ [key: string]: boolean }>({})
+const iptvTabContents = ref<{ [key: string]: string }>({})
 
 // 添加一个新的状态变量来跟踪当前是否在显示剧集列表
 const isShowingEpisodes = ref(false)
@@ -66,6 +70,329 @@ const contextMenu = ref<{
 })
 
 let vpsEndpointFlag = import.meta.env.VITE_VPS_ENDPOINT_FLAG || false
+
+// 检查站点 URL 是否为 IPTV 源
+const isIPTVSourceUrl = (url: string): boolean => {
+  if (!url) return false
+  const lowerCaseUrl = url.toLowerCase()
+  return lowerCaseUrl.endsWith('.m3u') || lowerCaseUrl.endsWith('.txt')
+}
+
+// 处理响应内容的解析和渲染
+const handleIPTVResponseContent = async (site: ResourceSite, index: number, content: string) => {
+
+  // 解析 IPTV 内容
+  let resultHtml = `
+    <div class="space-y-4">
+      <div class="flex flex-wrap justify-between items-center">
+        <div class="text-lg font-medium text-gray-900 dark:text-gray-100">IPTV源</div>
+        <div class="flex items-center max-w-[180px]">
+          <input 
+            type="text" 
+            placeholder="搜索频道..." 
+            class="w-full px-3 py-2 text-sm rounded-lg bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200 border border-gray-200 dark:border-gray-700 focus:outline-none focus:ring-1 focus:ring-primary-light dark:focus:ring-primary-dark" 
+            onkeyup="document.dispatchEvent(new CustomEvent('searchChannel', {detail: this.value}))"
+          />
+        </div>
+        <button 
+          class="px-4 py-2 text-sm rounded-lg bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700 border border-gray-200 dark:border-gray-700 hover:border-primary-light dark:hover:border-primary-dark shadow-sm hover:shadow font-medium"
+          onclick="document.dispatchEvent(new CustomEvent('showTagDialog'))"
+        >
+          标签
+        </button>
+      </div>
+      <div class="iptv-results flex flex-col space-y-2">
+  `
+  
+  // 解析 m3u 或 txt 文件
+  let groupedChannels: { [group: string]: {title: string, url: string}[] } = {}
+  let currentGroup = '默认分组'
+  // 用于跟踪分组添加顺序的数组
+  let groupOrder: string[] = []
+  
+  if (site.url.toLowerCase().endsWith('.m3u')) {
+    // 解析 m3u 格式
+    const lines = content.split('\n')
+    let currentTitle = ''
+    let lastGroupTitle = ''
+    let currentTvgName = ''
+    
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim()
+      
+      if (line.startsWith('#EXTINF:')) {
+        // 获取 tvg-name
+        const tvgNameMatch = line.match(/tvg-name="([^"]+)"/)
+        currentTvgName = tvgNameMatch ? tvgNameMatch[1].trim() : ''
+        
+        // 获取频道标题 (优先使用 tvg-name,如果没有则使用逗号后的标题)
+        const titleMatch = line.match(/,(.+)$/)
+        currentTitle = currentTvgName || (titleMatch ? titleMatch[1].trim() : `频道 ${Object.values(groupedChannels).flat().length + 1}`)
+        
+        // 尝试获取分组信息
+        const groupMatch = line.match(/group-title="([^"]+)"/)
+        if (groupMatch) {
+          currentGroup = groupMatch[1].trim()
+          lastGroupTitle = currentGroup
+          // 如果是新分组，添加到顺序数组中
+          if (!groupOrder.includes(currentGroup)) {
+            groupOrder.unshift(currentGroup)
+          }
+        } else {
+          // 如果没有组标题,使用上一个组标题或默认分组
+          currentGroup = lastGroupTitle || '默认分组'
+        }
+      } else if (line && !line.startsWith('#') && (line.includes('http://') || line.includes('https://'))) {
+        // 找到播放URL(必须是#EXTINF:的下一行)
+        if (currentTitle) {
+          if (!groupedChannels[currentGroup]) {
+            groupedChannels[currentGroup] = []
+          }
+          
+          groupedChannels[currentGroup].unshift({
+            title: currentTitle,
+            url: line
+          })
+          
+          // 重置当前标题和tvg-name,确保只处理#EXTINF:的下一行
+          currentTitle = ''
+          currentTvgName = ''
+        }
+      }
+    }
+  } else if (site.url.toLowerCase().endsWith('.txt')) {
+    // 解析 txt 格式
+    const lines = content.split('\n')
+    
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim()
+      if (!line) continue
+      
+      // 检查是否是分组标记行
+      if (line.includes('#genre#')) {
+        const parts = line.split(/,#genre#|，#genre#/)
+        currentGroup = parts[0].trim() || '默认分组'
+        if (!groupedChannels[currentGroup]) {
+          groupedChannels[currentGroup] = []
+          // 如果是新分组，添加到顺序数组中
+          if (!groupOrder.includes(currentGroup)) {
+            groupOrder.unshift(currentGroup)
+          }
+        }
+        continue
+      }
+      
+      // 尝试解析不同格式
+      if ((line.includes(',') || line.includes('，')) && (line.includes('http://') || line.includes('https://'))) {
+        // 格式: "标题,URL" 或者 "标题，URL"
+        const parts = line.split(/,|，/)
+        const title = parts[0].trim()
+        const url = parts.slice(1).join(',').trim()
+        
+        if (title && url) {
+          if (!groupedChannels[currentGroup]) {
+            groupedChannels[currentGroup] = []
+          }
+          
+          groupedChannels[currentGroup].unshift({ title, url })
+        }
+      } else if (line.includes('$') && (line.includes('http://') || line.includes('https://'))) {
+        // 格式: "标题$URL"
+        const parts = line.split('$')
+        const title = parts[0].trim()
+        const url = parts.slice(1).join('$').trim()
+        
+        if (url) {
+          if (!groupedChannels[currentGroup]) {
+            groupedChannels[currentGroup] = []
+          }
+          
+          groupedChannels[currentGroup].unshift({ 
+            title: title || `频道 ${groupedChannels[currentGroup].length + 1}`, 
+            url 
+          })
+        }
+      } else if (line.match(/^https?:\/\//)) {
+        // 仅包含URL，使用递增的频道名称
+        if (!groupedChannels[currentGroup]) {
+          groupedChannels[currentGroup] = []
+        }
+        
+        groupedChannels[currentGroup].unshift({
+          title: `频道 ${groupedChannels[currentGroup].length + 1}`,
+          url: line
+        })
+      }
+    }
+  }
+  
+  // 转换分组对象为有序数组，使用添加顺序而不是字母排序
+  let sortedGroups = [...groupOrder]
+  
+  // 确保默认分组存在并放在最前面
+  if (!sortedGroups.includes('默认分组') && groupedChannels['默认分组']) {
+    sortedGroups.unshift('默认分组')
+  } else if (sortedGroups.includes('默认分组') && sortedGroups[0] !== '默认分组') {
+    // 如果默认分组不在第一位，将其移到第一位
+    sortedGroups = ['默认分组', ...sortedGroups.filter(g => g !== '默认分组')]
+  }
+  
+  // 添加未在groupOrder中的分组（以防万一）
+  Object.keys(groupedChannels).forEach(group => {
+    if (!sortedGroups.includes(group)) {
+      sortedGroups.push(group)
+    }
+  })
+  
+  // 根据排序状态可能需要反转分组顺序
+  if (isReversed.value) {
+    sortedGroups.reverse()
+  }
+  
+  // 渲染分组和频道列表
+  let totalChannels = 0
+  
+  sortedGroups.forEach(groupName => {
+    const channels = groupedChannels[groupName]
+    
+    if (channels && channels.length > 0) {
+      // 添加分组标题
+      resultHtml += `
+        <div class="iptv-group-header mb-3 mt-5">
+          <div class="text-base font-medium py-2.5 px-4 bg-gray-100 dark:bg-gray-700 rounded-lg text-gray-800 dark:text-gray-200 flex items-center justify-center shadow-sm hover:shadow-md transition-shadow duration-300">
+            <span class="mx-auto flex items-center">
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2 text-primary-light dark:text-primary-dark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="2" y="6" width="20" height="12" rx="2"></rect>
+                <path d="M 12 18 L 12 22"></path>
+                <path d="M 8 22 L 16 22"></path>
+              </svg>
+              ${groupName} <span class="inline-block ml-1 px-2 py-0.5 bg-primary-light/10 dark:bg-primary-dark/20 text-primary-light dark:text-primary-dark rounded-full text-xs">${channels.length}</span>
+            </span>
+          </div>
+        </div>
+      `
+      
+      // 根据排序状态排序
+      let sortedChannels = [...channels]
+      if (isReversed.value) {
+        sortedChannels.reverse()
+      }
+      
+      // 渲染频道列表
+      sortedChannels.forEach(({ title, url }) => {
+        totalChannels++
+        resultHtml += `
+          <div class="m3u8-item iptv-item w-full group relative bg-white dark:bg-gray-800 rounded-lg cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700 shadow-sm hover:shadow-md dark:shadow-gray-900/10 border border-gray-100 dark:border-gray-700"
+                data-url="${url}"
+          >
+            <div class="p-3 text-sm font-medium text-gray-700 dark:text-gray-200 group-hover:text-primary-light dark:group-hover:text-primary-dark break-words" title="${title}">
+              ${title}
+            </div>
+            <div class="absolute inset-0 rounded-lg ring-1 ring-inset ring-gray-200 dark:ring-gray-700 group-hover:ring-primary-light/20 dark:group-hover:ring-primary-dark/20"></div>
+          </div>
+        `
+      })
+    }
+  })
+  
+  resultHtml += '</div></div>'
+  
+  // 保存生成的HTML
+  iptvTabContents.value[index] = resultHtml
+  
+  // 如果没有找到任何频道，显示错误信息
+  if (totalChannels === 0) {
+    iptvTabContents.value[index] = `
+      <div class="p-4 bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 rounded-lg border border-red-100 dark:border-red-900/30">
+        <p class="font-medium">未找到可播放的频道</p>
+        <p class="mt-2 text-sm">请检查 IPTV 源格式是否正确</p>
+      </div>
+    `
+  }
+}
+
+// 解析 IPTV 源内容
+const parseIPTVSource = async (site: ResourceSite, index: number) => {
+  try {
+    isLoading.value[index] = true
+    
+    // 根据环境选择正确的 API 端点
+    const apiEndpoint = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1' || vpsEndpointFlag 
+      ? '/api/search' 
+      : '/functions/api/search'
+    
+    // 发送请求获取 IPTV 源内容
+    const response = await fetch(apiEndpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ url: site.url })
+    })
+
+    if (!response.ok) {
+      throw new Error(`请求失败: ${response.status}`)
+    }
+
+    const content = await response.text()
+    
+    await handleIPTVResponseContent(site, index, content)
+    
+  } catch (error) {
+    try {
+      isLoading.value[index] = true
+    
+      // 使用代理重试
+      const proxyUrl = `https://r.jina.ai/${site.url}`
+      
+      // 发送请求获取 IPTV 源内容
+      const proxyResponse = await fetch(proxyUrl, {
+        headers: {
+          'Accept': '*/*',
+          'X-No-Cache': 'true',
+          'X-Timeout': '5'
+        }
+      })
+
+      if (!proxyResponse.ok) {
+        throw new Error(`代理请求失败: ${proxyResponse.status}`)
+      }
+
+      const proxyContent = await proxyResponse.text()
+
+      await handleIPTVResponseContent(site, index, proxyContent)
+
+    } catch (error) {
+      console.error('解析 IPTV 源失败:', error)
+      iptvTabContents.value[index] = `
+        <div class="error-message p-4 bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 rounded-lg border border-red-100 dark:border-red-900/30">
+          <p class="font-medium">解析 IPTV 源失败:</p>
+          <p class="mt-1">${error instanceof Error ? error.message : '未知错误'}</p>
+          <p class="mt-2 text-sm">请检查网络连接或稍后重试</p>
+          <button 
+            class="mt-3 px-4 py-2 bg-primary-light dark:bg-primary-dark text-white rounded-lg hover:bg-primary-light/90 dark:hover:bg-primary-dark/90 transition-colors shadow-sm"
+            onclick="document.dispatchEvent(new CustomEvent('retryParseIPTV', {detail: ${index}}))"
+          >
+            重试
+          </button>
+        </div>
+      `
+    }
+  } finally {
+    isLoading.value[index] = false
+  }
+}
+
+// 处理重试解析IPTV源事件
+const handleRetryParseIPTV = (event: CustomEvent) => {
+  const index = event.detail
+  if (typeof index === 'number') {
+    const site = props.sites.filter(s => s.active)[index]
+    if (site) {
+      parseIPTVSource(site, index)
+    }
+  }
+}
 
 // 创建一个Helper函数来处理SweetAlert2样式问题
 const setupSwalButtonStyles = () => {
@@ -212,17 +539,26 @@ const showTagDialog = () => {
     // 使用保存的标签信息来构建弹窗
     const tag = currentTagInfo.value
     
+    // 检查detailUrl的类型，判断是否是html
+    const videoType = detectVideoType(tag.detailPageUrl || '')
+    const isHtmlType = videoType === 'html'
+    const isEpisodeNumberEditable = isHtmlType
+    
     Swal.fire({
       title: '视频标签',
       html: `
         <div class="text-left space-y-3">
           <div class="mb-2">
-            <div class="text-sm font-medium text-gray-500 dark:text-gray-400">剧集名称</div>
-            <input id="seriesName" class="mt-1 w-full p-2 rounded border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white" value="${tag.seriesName || ''}">
+            <div class="text-sm font-medium text-gray-500 dark:text-gray-400">剧集名称
+            ${!isEpisodeNumberEditable ? '<span class="text-xs text-yellow-500 ml-1">(不可编辑，IPTV源)</span>' : ''}</div>
+            <input id="seriesName" class="mt-1 w-full p-2 rounded border border-gray-200 dark:border-gray-700 ${!isEpisodeNumberEditable ? 'bg-gray-100 dark:bg-gray-700 cursor-not-allowed' : 'bg-white dark:bg-gray-800'} text-gray-900 dark:text-white" value="${tag.seriesName || ''}" ${!isEpisodeNumberEditable ? 'disabled' : ''}>
           </div>
           <div class="mb-2">
-            <div class="text-sm font-medium text-gray-500 dark:text-gray-400">追更集数</div>
-            <input id="episodeNumber" class="mt-1 w-full p-2 rounded border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white" value="${tag.episodeNumber || ''}">
+            <div class="text-sm font-medium text-gray-500 dark:text-gray-400">
+              追更集数
+              ${!isEpisodeNumberEditable ? '<span class="text-xs text-yellow-500 ml-1">(不可编辑，IPTV源)</span>' : ''}
+            </div>
+            <input id="episodeNumber" class="mt-1 w-full p-2 rounded border border-gray-200 dark:border-gray-700 ${!isEpisodeNumberEditable ? 'bg-gray-100 dark:bg-gray-700 cursor-not-allowed' : 'bg-white dark:bg-gray-800'} text-gray-900 dark:text-white" value="${tag.episodeNumber || ''}" ${!isEpisodeNumberEditable ? 'disabled' : ''}>
           </div>
           <div class="mb-2">
             <div class="text-sm font-medium text-gray-500 dark:text-gray-400">资源站点</div>
@@ -354,6 +690,11 @@ const showTagDialog = () => {
   }
   
   let seriesName = savedKeyword.value || (props.keyword || '')
+
+  // 如果当前站点是IPTV源，则使用IPTV作为剧集名称
+  if (isIPTVSource.value[activeTab.value]) {
+    seriesName = 'IPTV';
+  }
   
   // 获取追更集数或最新集数
   let currentEpisode = ''
@@ -397,17 +738,26 @@ const showTagDialog = () => {
   const isTagged = hasTag(currentSite, seriesName)
   const updateDays = tagInfo?.updateDays || []
   
+  // 检查detailUrl的类型，判断是否是html
+  const videoType = detectVideoType(detailPageUrl || '')
+  const isHtmlType = videoType === 'html'
+  const isEpisodeNumberEditable = isHtmlType
+  
   Swal.fire({
     title: '视频标签',
     html: `
       <div class="text-left space-y-3">
         <div class="mb-2">
-          <div class="text-sm font-medium text-gray-500 dark:text-gray-400">剧集名称</div>
-          <input id="seriesName" class="mt-1 w-full p-2 rounded border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white" value="${seriesName}">
+          <div class="text-sm font-medium text-gray-500 dark:text-gray-400">剧集名称
+          ${!isEpisodeNumberEditable ? '<span class="text-xs text-yellow-500 ml-1">(不可编辑，IPTV源)</span>' : ''}</div>
+          <input id="seriesName" class="mt-1 w-full p-2 rounded border border-gray-200 dark:border-gray-700 ${!isEpisodeNumberEditable ? 'bg-gray-100 dark:bg-gray-700 cursor-not-allowed' : 'bg-white dark:bg-gray-800'} text-gray-900 dark:text-white" value="${seriesName}" ${!isEpisodeNumberEditable ? 'disabled' : ''}>
         </div>
         <div class="mb-2">
-          <div class="text-sm font-medium text-gray-500 dark:text-gray-400">追更集数</div>
-          <input id="episodeNumber" class="mt-1 w-full p-2 rounded border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-900 dark:text-white" value="${currentEpisode}">
+          <div class="text-sm font-medium text-gray-500 dark:text-gray-400">
+            追更集数
+            ${!isEpisodeNumberEditable ? '<span class="text-xs text-yellow-500 ml-1">(不可编辑，IPTV源)</span>' : ''}
+          </div>
+          <input id="episodeNumber" class="mt-1 w-full p-2 rounded border border-gray-200 dark:border-gray-700 ${!isEpisodeNumberEditable ? 'bg-gray-100 dark:bg-gray-700 cursor-not-allowed' : 'bg-white dark:bg-gray-800'} text-gray-900 dark:text-white" value="${currentEpisode}" ${!isEpisodeNumberEditable ? 'disabled' : ''}>
         </div>
         <div class="mb-2">
           <div class="text-sm font-medium text-gray-500 dark:text-gray-400">资源站点</div>
@@ -536,12 +886,6 @@ const getTagButtonContent = (siteName: string = '', seriesName: string = '') => 
     : '<span class="mr-1 text-gray-400">?</span>标签'
 }
 
-// 获取站点URL
-const getSiteUrl = (site: ResourceSite) => {
-  if (!props.keyword) return site.url
-  return site.url.includes('?') ? `${site.url}${props.keyword}` : site.url
-}
-
 // 执行所有站点的搜索
 const performSearch = async () => {
   if (!props.keyword) return
@@ -571,6 +915,12 @@ const performSearch = async () => {
   let completedSites = 0
   
   const searchPromises = activeSites.map((site, index) => {
+    // 跳过 IPTV 源站点，不参与搜索
+    if (isIPTVSource.value[index]) {
+      completedSites++
+      return Promise.resolve()
+    }
+    
     isLoading.value[index] = true
     return new Promise<void>(async (resolve) => {
       await searchSite(site, index)
@@ -1089,7 +1439,7 @@ const handleContainerClick = (event: MouseEvent) => {
     if (url) {
       
       // 检查是否是m3u8链接
-      if (url.toLowerCase().includes('.m3u8')) {
+      if (url.toLowerCase().includes('.m3u8') || isIPTVSource.value[activeTab.value]) {
         
         // 保存当前视频信息用于标签功能
         const title = clickedItem.querySelector('.text-center, .text-primary-light, .text-primary-dark, [class*="text-primary"], [class*="text-center"]')?.textContent?.trim() || ''
@@ -1111,7 +1461,6 @@ const handleContainerClick = (event: MouseEvent) => {
           siteRemark: siteRemark,
           detailPageUrl: currentVideoInfo.value.detailPageUrl || url
         }
-        
 
         // 更新激活的剧集 URL
         activeEpisodeUrl.value = url
@@ -1338,7 +1687,7 @@ const showTagsListDialog = () => {
     const seriesName = tag.seriesName || '未知剧集'
     const episodeNumber = tag.episodeNumber || '未知集数'
     const date = new Date(tag.timestamp).toLocaleString()
-    const hasDetailUrl = !!tag.detailPageUrl
+    const hasDetailUrl = !!tag.detailPageUrl && seriesName !== 'IPTV'
     
     // 转换更新日期为可读文本
     const updateDaysText = tag.updateDays?.length 
@@ -1446,8 +1795,10 @@ const applyTag = (key: string) => {
       // 关闭标签列表弹窗
       Swal.close()
       
+      const videoType = detectVideoType(tag.detailPageUrl)
+
       // 如果有剧集列表URL，先加载剧集列表
-      if (tag.detailPageUrl) {
+      if (tag.detailPageUrl && videoType === 'html') {
         // 在标签页中显示加载状态，而不是使用弹窗
         tagsTabContent.value = `
           <div class="flex flex-col items-center justify-center py-8 space-y-4">
@@ -1546,7 +1897,7 @@ const applyTag = (key: string) => {
           // 生成HTML
           links.forEach(({ title, url }) => {
             // 检查当前URL是否与当前激活的剧集URL匹配
-            const isCurrentVideo = url === activeEpisodeUrl.value || url === tag.url
+            const isCurrentVideo = title === tag.episodeNumber
             resultHtml += `
               <div class="m3u8-item group relative bg-white dark:bg-gray-800 rounded-lg cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700 shadow-sm hover:shadow-md dark:shadow-gray-900/10 border border-gray-100 dark:border-gray-700 ${isCurrentVideo ? 'ring-2 ring-primary-light dark:ring-primary-dark active' : ''}"
                    data-url="${url}"
@@ -1566,15 +1917,6 @@ const applyTag = (key: string) => {
           // 设置标签页内容
           tagsTabContent.value = resultHtml
           
-          // 如果有播放URL，触发播放
-          if (tag.url) {
-            // 添加提示
-            const message = document.createElement('div')
-            message.className = 'fixed top-4 right-4 bg-green-500 text-white px-4 py-2 rounded shadow-lg'
-            message.textContent = '已应用标签'
-            document.body.appendChild(message)
-            setTimeout(() => message.remove(), 2000)
-          }
         }).catch(error => {
           console.error('加载剧集列表失败:', error)
           // 在标签页中显示错误信息
@@ -1592,7 +1934,7 @@ const applyTag = (key: string) => {
             </div>
           `
         })
-      } else if (tag.url) {
+      } else if (tag.detailPageUrl) {
         // 如果没有剧集列表URL，直接显示单个视频
         tagsTabContent.value = `
           <div class="space-y-4">
@@ -1612,7 +1954,7 @@ const applyTag = (key: string) => {
             </div>
             <div class="m3u8-results flex flex-wrap gap-3">
               <div class="m3u8-item group relative bg-white dark:bg-gray-800 rounded-lg cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700 shadow-sm hover:shadow-md dark:shadow-gray-900/10 border border-gray-100 dark:border-gray-700 ring-2 ring-primary-light dark:ring-primary-dark active"
-                   data-url="${tag.url}"
+                   data-url="${tag.detailPageUrl}"
               >
                 <div class="p-3 text-sm font-medium text-primary-light dark:text-primary-dark text-center group-hover:text-primary-light dark:group-hover:text-primary-dark line-clamp-2 break-words" title="${tag.episodeNumber || '未知集数'}">
                   ${tag.episodeNumber || '未知集数'}
@@ -1819,8 +2161,8 @@ const handleDeleteTag = (event: CustomEvent) => {
 
 // 添加一个新方法用于在搜索时切换标签
 const switchToFirstNonTagTab = () => {
-  // 如果当前是标签页，切换到第一个非标签页
-  if (showTagsTab.value) {
+  // 如果当前是标签页 或者 IPTV源，切换到第一个非标签页
+  if (showTagsTab.value || isIPTVSource.value[activeTab.value]) {
     showTagsTab.value = false
     activeTab.value = 0
   }
@@ -1900,7 +2242,13 @@ const handleSaveAsTag = () => {
     // 否则使用正常的逻辑
     currentSite = props.sites.filter(s => s.active)[activeTab.value]?.remark || '';
     seriesName = savedKeyword.value || props.keyword || ''
-    detailPageUrl = currentVideoInfo.value.detailPageUrl || ''
+
+    // 对于IPTV源，将detailPageUrl设置为实际播放URL，而不是IPTV源URL
+    if (isIPTVSource.value[activeTab.value]) {
+      detailPageUrl = contextMenu.value.episodeUrl || ''
+    } else {
+      detailPageUrl = currentVideoInfo.value.detailPageUrl || ''
+    }
   }
   
   // 获取剧集集数
@@ -1919,6 +2267,11 @@ const handleSaveAsTag = () => {
   const note = tagInfo?.note || ''
 
   detailPageUrl = tagInfo?.detailPageUrl || detailPageUrl
+  
+  // 对于IPTV源，确保剧集名称始终为"IPTV"
+  if (isIPTVSource.value[activeTab.value]) {
+    seriesName = "IPTV"
+  }
   
   // 直接保存标签，不显示弹窗
   saveTag(currentSite, seriesName, episodeNumber, detailPageUrl, note, updateDays)
@@ -1970,6 +2323,40 @@ const handleSaveAsTag = () => {
   setTimeout(() => message.remove(), 2000)
 }
 
+// 检测视频格式
+const detectVideoType = (url: string): string => {
+  const extension = url.split('?')[0].split('.').pop()?.toLowerCase()
+
+  switch (extension) {
+    case 'm3u8':
+      return 'm3u8'
+    case 'mp4':
+      return 'auto'
+    case 'webm':
+      return 'auto'
+    case 'ogv':
+      return 'auto'
+    case 'flv':
+      return 'flv'
+    case 'html':
+      return 'html'
+    case 'com':
+      return 'html'
+    case 'cn':
+      return 'html'
+    default:
+      // 如果链接包含特定关键字
+      if (url.includes('.m3u8')) {
+        return 'm3u8'
+      }
+      if (url.includes('.html') || url.includes('.com') || url.includes('.cn')) {
+        return 'html'
+      }
+
+      return 'auto'
+  }
+}
+
 // 添加事件监听
 onMounted(() => {  
   // 添加事件监听
@@ -1982,6 +2369,8 @@ onMounted(() => {
   document.addEventListener('retrySearch', handleRetrySearch as EventListener)
   document.addEventListener('retryResultClick', handleRetryResultClick as EventListener)
   document.addEventListener('retryApplyTag', handleRetryApplyTag as EventListener)
+  document.addEventListener('retryParseIPTV', handleRetryParseIPTV as EventListener)
+  document.addEventListener('searchChannel', handleSearchChannel as EventListener)
   
   // 添加鼠标右键事件委托
   document.addEventListener('click', (e) => {
@@ -1993,6 +2382,30 @@ onMounted(() => {
       }
     }
   })
+  
+  // 检查并解析 IPTV 源
+  props.sites.filter(s => s.active).forEach((site, index) => {
+    if (isIPTVSourceUrl(site.url)) {
+      isIPTVSource.value[index] = true
+      parseIPTVSource(site, index)
+      
+      // 在首页访问时自动设置已搜索状态
+      hasSearched.value = true
+    } else {
+      isIPTVSource.value[index] = false
+    }
+  })
+  
+  // 添加全局滚动监听函数
+  setTimeout(() => {
+    const containers = document.querySelectorAll('.search-results-container')
+    containers.forEach(container => {
+      container.addEventListener('scroll', handleScroll)
+    })
+  }, 500)
+  
+  // 初始检查滚动位置
+  checkActiveTabScrollPosition()
 })
 
 // 移除事件监听
@@ -2006,6 +2419,14 @@ onUnmounted(() => {
   document.removeEventListener('retrySearch', handleRetrySearch as EventListener)
   document.removeEventListener('retryResultClick', handleRetryResultClick as EventListener)
   document.removeEventListener('retryApplyTag', handleRetryApplyTag as EventListener)
+  document.removeEventListener('retryParseIPTV', handleRetryParseIPTV as EventListener)
+  document.removeEventListener('searchChannel', handleSearchChannel as EventListener)
+  
+  // 移除全局滚动监听函数
+  const containers = document.querySelectorAll('.search-results-container')
+  containers.forEach(container => {
+    container.removeEventListener('scroll', handleScroll)
+  })
 })
 
 // 处理重试搜索事件
@@ -2034,6 +2455,121 @@ const handleRetryApplyTag = (event: CustomEvent) => {
   const key = event.detail
   if (key) {
     applyTag(key)
+  }
+}
+
+// 处理频道搜索事件
+const handleSearchChannel = (event: CustomEvent) => {
+  const keyword = event.detail
+  if (typeof keyword === 'string') {
+    channelSearchKeyword.value = keyword
+    scrollToChannel(keyword)
+  }
+}
+
+// 添加IPTV频道搜索状态
+const channelSearchKeyword = ref('')
+const scrollToChannel = (title: string) => {
+  if (!title) return
+  
+  // 使用nextTick确保DOM更新后再滚动
+  nextTick(() => {
+    // 如果当前是IPTV源，则使用IPTV源的频道搜索
+    if (isIPTVSource.value[activeTab.value]) {
+      // 获取当前IPTV tab的所有频道
+      // 获取当前活动标签页的容器
+      const activeContainer = document.querySelector(`.search-results-container[data-tab-index="${activeTab.value}"]`)
+      if (!activeContainer) return
+
+      const channelElements = activeContainer.querySelectorAll('.iptv-item')
+      // 查找匹配标题的频道
+      for (let i = 0; i < channelElements.length; i++) {
+      const element = channelElements[i] as HTMLElement
+      const channelTitle = element.querySelector('div[title]')?.getAttribute('title')
+      if (channelTitle && channelTitle.toLowerCase().includes(title.toLowerCase())) {
+        // 滚动到匹配的频道
+        element.scrollIntoView({ behavior: 'smooth', block: 'center' })
+        // 添加一个临时高亮效果
+        element.classList.add('ring-2', 'ring-primary-light', 'dark:ring-primary-dark')
+        setTimeout(() => {
+          element.classList.remove('ring-2', 'ring-primary-light', 'dark:ring-primary-dark')
+          }, 2000)
+          break
+        }
+      }
+    }
+  })
+}
+
+// 添加返回顶部按钮状态
+const showBackToTop = ref(false)
+
+// 监听滚动事件，控制返回顶部按钮的显示和隐藏
+const handleScroll = (event: Event) => {
+  // 获取滚动的容器元素
+  const container = event.target as HTMLElement
+  if (container) {
+    // 当滚动超过100px时显示按钮
+    showBackToTop.value = container.scrollTop > 100
+  }
+}
+
+// 检查当前活动标签页的滚动位置
+const checkActiveTabScrollPosition = () => {
+  nextTick(() => {
+    let container: HTMLElement | null = null
+    
+    if (showTagsTab.value) {
+      container = document.querySelector('.search-results-container[data-tab-index="tags"]')
+    } else {
+      container = document.querySelector(`.search-results-container[data-tab-index="${activeTab.value}"]`)
+    }
+    
+    if (container) {
+      showBackToTop.value = container.scrollTop > 100
+    } else {
+      showBackToTop.value = false
+    }
+  })
+}
+
+// 监听标签页切换
+watch([activeTab, showTagsTab], () => {
+  checkActiveTabScrollPosition()
+})
+
+// 返回顶部方法
+const scrollToTop = () => {
+  // 查找当前激活的搜索结果容器
+  let container: HTMLElement | null = null
+  
+  if (showTagsTab.value) {
+    // 在标签页内
+    container = document.querySelector('.search-results-container')
+  } else {
+    // 在其他标签页，获取当前激活的标签页容器
+    const activeContainer = document.querySelector(`.search-results-container[data-tab-index="${activeTab.value}"]`)
+    if (activeContainer) {
+      container = activeContainer as HTMLElement
+    } else {
+      // 备用方法：遍历所有容器找到可见的那个
+      const containers = document.querySelectorAll('.search-results-container')
+      containers.forEach(el => {
+        const parent = el.parentElement
+        if (parent && parent.parentElement && 
+            (parent.parentElement.style.display !== 'none' || 
+             window.getComputedStyle(parent.parentElement).display !== 'none')) {
+          container = el as HTMLElement
+        }
+      })
+    }
+  }
+  
+  if (container) {
+    container.scrollTo({
+      top: 0,
+      behavior: 'smooth'
+    })
   }
 }
 </script>
@@ -2079,8 +2615,10 @@ const handleRetryApplyTag = (event: CustomEvent) => {
           <div 
             ref="searchResultsContainer"
             class="search-results-container"
+            data-tab-index="tags"
             @click="handleContainerClick"
             @contextmenu="handleContextMenu"
+            @scroll="handleScroll"
           >
             <div v-if="tagsTabContent" v-html="tagsTabContent"></div>
             <div v-else class="text-center py-8 text-gray-500 dark:text-gray-400">
@@ -2098,8 +2636,10 @@ const handleRetryApplyTag = (event: CustomEvent) => {
             <div 
               ref="searchResultsContainer"
               class="search-results-container"
+              :data-tab-index="index"
               @click="handleContainerClick"
               @contextmenu="handleContextMenu"
+              @scroll="handleScroll"
             >
               <!-- 加载状态 -->
               <div 
@@ -2116,6 +2656,8 @@ const handleRetryApplyTag = (event: CustomEvent) => {
                   </template>
                 </div>
               </div>
+              <!-- IPTV 源内容 -->
+              <div v-else-if="isIPTVSource[index]" v-html="iptvTabContents[index]"></div>
               <!-- 搜索结果 -->
               <div v-else>
                 <div v-if="searchResults[index]" v-html="searchResults[index]"></div>
@@ -2132,6 +2674,17 @@ const handleRetryApplyTag = (event: CustomEvent) => {
       <div v-if="!hasSearched" class="text-center py-8 text-gray-500 dark:text-gray-400">
         请输入关键词进行搜索
       </div>
+    </div>
+    
+    <!-- 添加独立的返回顶部按钮 -->
+    <div 
+      v-show="showBackToTop"
+      class="back-to-top-btn fixed bottom-6 right-6 w-9 h-9 rounded-full bg-primary-light dark:bg-primary-dark text-white shadow-lg flex items-center justify-center cursor-pointer hover:opacity-90 transition-all z-100 transform hover:scale-110"
+      @click="scrollToTop"
+    >
+      <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+        <path fill-rule="evenodd" d="M14.707 12.707a1 1 0 01-1.414 0L10 9.414l-3.293 3.293a1 1 0 01-1.414-1.414l4-4a1 1 0 011.414 0l4 4a1 1 0 010 1.414z" clip-rule="evenodd" />
+      </svg>
     </div>
     
     <!-- 右键菜单 -->
@@ -2166,7 +2719,13 @@ iframe {
 }
 
 .search-results-container {
-  @apply p-2;
+  @apply p-2 h-[calc(100vh-200px)] overflow-y-auto relative;
+}
+
+/* 添加返回顶部按钮样式 */
+.back-to-top-btn {
+  opacity: 0.9;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
 }
 
 .search-results-container :deep(.search-results) {
@@ -2238,7 +2797,7 @@ iframe {
 :deep(.swal2-button:focus) {
   box-shadow: none !important;
   outline: none !important;
-  border-color: transparent !important;
+  border: none !important;
 }
 
 /* 全局覆盖SweetAlert2按钮样式 */

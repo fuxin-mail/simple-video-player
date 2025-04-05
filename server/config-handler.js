@@ -1,4 +1,4 @@
-import { withConnection } from './db.js'
+import { withConnection, readJsonConfig, writeJsonConfig } from './db.js'
 import postgres from 'postgres'
 
 // 默认配置
@@ -41,7 +41,7 @@ function decodeBase64(str) {
 
 /**
  * 确定使用的数据库类型和连接字符串
- * @returns {{type: 'mysql'|'postgresql', connectionString: string}|null}
+ * @returns {{type: 'mysql'|'postgresql'|'json', connectionString: string}|null}
  */
 function getDbConnectionInfo() {
   const sqlDsn = process.env.SQL_DSN
@@ -53,7 +53,8 @@ function getDbConnectionInfo() {
     return { type: 'postgresql', connectionString: pgConnectionString }
   }
   
-  return null
+  // 如果没有配置数据库连接信息，使用JSON文件
+  return { type: 'json', connectionString: '' }
 }
 
 /**
@@ -64,14 +65,15 @@ function getDbConnectionInfo() {
 async function withDatabaseConnection(callback) {
   const connInfo = getDbConnectionInfo()
   
-  if (!connInfo) {
-    console.log('未提供数据库连接信息')
-    return defaultConfig
-  }
-  
-  if (connInfo.type === 'mysql') {
+  if (connInfo.type === 'json') {
+    // 使用JSON文件存储
+    return await callback(null, 'json')
+  } else if (connInfo.type === 'mysql') {
     // 使用MySQL连接
-    return await withConnection(connInfo.connectionString, callback)
+    // 修复：直接将回调函数传递给withConnection，而不是期望它返回connection对象
+    return await withConnection(connInfo.connectionString, async (connection) => {
+      return await callback(connection, 'mysql')
+    })
   } else {
     // 使用PostgreSQL连接
     try {
@@ -79,6 +81,8 @@ async function withDatabaseConnection(callback) {
         max: 1,
         idle_timeout: 2,
         connect_timeout: 5,
+        debug: false,  // 禁用调试输出
+        onnotice: () => {}, // 忽略NOTICE消息
         types: {
           jsonb: {
             to: 1184,
@@ -97,34 +101,42 @@ async function withDatabaseConnection(callback) {
             config JSONB NOT NULL,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
           )
-        `
-        return await callback(sql)
+        `;
+        
+        return await callback(sql, 'postgresql')
       } finally {
         await sql.end()
       }
     } catch (error) {
       console.error('PostgreSQL操作失败:', error)
-      throw error
+      // 降级为JSON文件
+      return await callback(null, 'json')
     }
   }
 }
 
-// 获取配置
-export async function getConfig() {
+/**
+ * 获取配置 - 内部使用，不加密密码
+ */
+async function getConfigInternal() {
   try {
-    return await withDatabaseConnection(async (connection) => {
-      if (getDbConnectionInfo()?.type === 'mysql') {
+    return await withDatabaseConnection(async (connection, type) => {
+      if (type === 'json') {
+        // 使用JSON文件存储
+        const config = await readJsonConfig()
+        // 如果JSON为空，返回默认配置
+        if (!config || Object.keys(config).length === 0) {
+          return defaultConfig
+        }
+        
+        // 如果有appConfig键，则使用它
+        const finalConfig = config.appConfig || config
+        return finalConfig
+      } else if (type === 'mysql') {
         // MySQL查询
         const [rows] = await connection.query('SELECT config FROM configs ORDER BY id DESC LIMIT 1')
         if (Array.isArray(rows) && rows.length > 0) {
           const config = typeof rows[0].config === 'string' ? JSON.parse(rows[0].config) : rows[0].config
-          
-          // 如果有密码，在返回前进行三次Base64加密，仅用于传输
-          if (config.loginPassword) {
-            console.log('对密码进行三次Base64加密用于传输')
-            config.loginPassword = encodeBase64(config.loginPassword)
-          }
-          
           return config
         }
       } else {
@@ -132,13 +144,6 @@ export async function getConfig() {
         const rows = await connection`SELECT config FROM configs ORDER BY id DESC LIMIT 1`
         if (rows.length > 0) {
           const config = rows[0].config
-          
-          // 如果有密码，在返回前进行三次Base64加密，仅用于传输
-          if (config.loginPassword) {
-            console.log('对密码进行三次Base64加密用于传输')
-            config.loginPassword = encodeBase64(config.loginPassword)
-          }
-          
           return config
         }
       }
@@ -153,29 +158,51 @@ export async function getConfig() {
   }
 }
 
+/**
+ * 获取配置 - API接口使用，会对密码进行加密
+ */
+export async function getConfig() {
+  const config = await getConfigInternal()
+  
+  // 创建一个副本，避免修改原始配置
+  const configCopy = { ...config }
+  
+  // 如果有密码，在返回前进行三次Base64加密，仅用于传输
+  if (configCopy.loginPassword) {
+    //console.log('对密码进行三次Base64加密用于传输')
+    configCopy.loginPassword = encodeBase64(configCopy.loginPassword)
+  }
+  
+  return configCopy
+}
+
 // 更新配置
 export async function updateConfig(config) {
   try {
-    return await withDatabaseConnection(async (connection) => {
+    return await withDatabaseConnection(async (connection, type) => {
       // 创建配置的副本
       const configToUpdate = { ...config }
       
-      // 密码不需要解密，因为前端传来的就是明文密码
-      // 数据库中存储的也是明文密码
-
-      // 判断配置对象是否已经是JSON字符串
-      const isJsonString = (value) => {
-        if (typeof value !== 'string') return false
-        try {
-          const parsed = JSON.parse(value)
-          return typeof parsed === 'object' && parsed !== null
-        } catch (e) {
-          return false
+      if (type === 'json') {
+        // 使用JSON文件存储
+        const result = await writeJsonConfig({ appConfig: configToUpdate })
+        return { 
+          success: result, 
+          message: result ? '配置更新成功！' : '配置更新失败！' 
         }
-      }
-
-      if (getDbConnectionInfo()?.type === 'mysql') {
+      } else if (type === 'mysql') {
         // MySQL操作
+        // 判断配置对象是否已经是JSON字符串
+        const isJsonString = (value) => {
+          if (typeof value !== 'string') return false
+          try {
+            const parsed = JSON.parse(value)
+            return typeof parsed === 'object' && parsed !== null
+          } catch (e) {
+            return false
+          }
+        }
+        
         // 先检查是否存在记录
         const [rows] = await connection.query('SELECT id FROM configs LIMIT 1')
         
@@ -226,7 +253,7 @@ export async function updateConfig(config) {
 
 // 获取公开配置（不包含密码）
 export async function getPublicConfig() {
-  const config = await getConfig()
+  const config = await getConfigInternal()
   const { loginPassword, ...publicConfig } = config
   return publicConfig
 }
@@ -234,27 +261,10 @@ export async function getPublicConfig() {
 // 验证密码（使用明文对比）
 export async function verifyPassword(password) {
   try {
-    return await withDatabaseConnection(async (connection) => {
-      if (getDbConnectionInfo()?.type === 'mysql') {
-        // MySQL查询
-        const [rows] = await connection.query('SELECT config FROM configs ORDER BY id DESC LIMIT 1')
-        if (Array.isArray(rows) && rows.length > 0) {
-          const dbConfig = typeof rows[0].config === 'string' ? JSON.parse(rows[0].config) : rows[0].config
-          return password === dbConfig.loginPassword
-        }
-      } else {
-        // PostgreSQL查询
-        const rows = await connection`SELECT config FROM configs ORDER BY id DESC LIMIT 1`
-        if (rows.length > 0) {
-          const dbConfig = rows[0].config
-          return password === dbConfig.loginPassword
-        }
-      }
-      return true
-    }).catch(error => {
-      console.error('验证密码失败:', error)
-      return false
-    })
+    // 使用内部版本获取配置，确保获取的是未加密的原始密码
+    const config = await getConfigInternal()
+    
+    return password === config.loginPassword
   } catch (error) {
     console.error('验证密码失败:', error)
     return false
