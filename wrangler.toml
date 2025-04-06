@@ -1,0 +1,9 @@
+name = "simple-video-player"
+compatibility_date = "2025-03-25"
+compatibility_flags = ["nodejs_compat"]
+
+pages_build_output_dir = "dist"
+
+#kv_namespaces = [
+#  { binding = "VIDEO_CONFIG", id = "your kv id"}
+#]
